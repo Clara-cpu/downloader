@@ -7,14 +7,26 @@ import concurrent.futures
 
 log = logging.getLogger(__name__)
 
+"""
+Keep track of files that are downloaded, so that we do not download again.
+Delete / move files already downloaded, so that we do not download again. - When? May not be complete at time of download
+Encrypt files again before uploading.
+Delete files from local drive and source drive after uploading 
+Scrape frequency???
+"""
+
 class Downloader():
-    def __init__(self, m_token, m_remote_dir, m_local_dir, m_max_download_threads):
+    def __init__(self, m_token, m_remote_dir, m_to_download, m_local_dir, m_max_download_threads, m_to_delete, m_to_backup):
         self.TOKEN = m_token
-        self.REMOTE_DIR = m_remote_dir                  # Remote folder
-        self.LOCAL_DIR = m_local_dir                    # Local folder
-        self.MAX_THREADS = int(m_max_download_threads)  # No. of concurrent downloads
+        self.REMOTE_DIR = m_remote_dir                  # Remote root folder
+        self.to_download = m_to_download
+        self.LOCAL_DIR = m_local_dir                    # Local root folder
+        self.MAX_THREADS = m_max_download_threads       # No. of concurrent downloads
+        self.to_delete = m_to_delete
+        self.to_backup = m_to_backup
         self.folders = {}                               # Folders
-        self.files = []                                 # List of files to download
+        self.files_to_download = []                     # List of files to download
+        self.files_to_delete_or_backup = []             # List of files to delete or backup
 
     def get_all_metadata(self, folder='/'):
         """
@@ -32,7 +44,7 @@ class Downloader():
             return json.loads(resp.content)
         else:
             return resp
-
+             
     def get_file_link(self, fileid):
         """
         Get download link of file
@@ -68,25 +80,19 @@ class Downloader():
                     self.set_file(obj['parentfolderid'], obj['name'], filelink_obj)
         
             # Downloads files concurrently
-            if len(self.files) >= self.MAX_THREADS:
-                log.debug(f"Downloading {len(self.files)} files")
+            if len(self.files_to_download) >= self.MAX_THREADS:
+                log.debug(f"Downloading {len(self.files_to_download)} files")
                 self.download_files_concurrent()
 
+            # Move to next set of files
             if 'contents' in obj:
                 self.get_file_objects(obj['contents'])
 
         # Downloads remaining files
-        if len(self.files) > 0:
-            log.debug(f"Downloading {len(self.files)} files")
+        if len(self.files_to_download) > 0:
+            log.debug(f"Downloading {len(self.files_to_download)} files")
             self.download_files_concurrent()
 
-    """
-    Keep track of files that are downloaded, so that we do not download again.
-    Delete files already downloaded, so that we do not download again.
-    Encrypt file again before uploading.
-    Delete file from local drive and source drive after uploading 
-
-    """
     def download_file(self, file):
         """
         Download a single file
@@ -100,7 +106,7 @@ class Downloader():
                     for chunk in resp.iter_content(chunk_size=8192):
                         fout.write(chunk)
 
-                    return f"Downloaded {self.LOCAL_DIR}/{file['filePath']}"
+                    return f"{file['filePath']}"
         except requests.exceptions.RequestException as e:
             log.error('Error', e)    
 
@@ -110,7 +116,7 @@ class Downloader():
         """
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_THREADS) as executor:
             futures = []
-            for file in self.files:
+            for file in self.files_to_download:
                 futures.append(executor.submit(self.download_file, file=file))
                 
             for future in concurrent.futures.as_completed(futures):
@@ -118,8 +124,47 @@ class Downloader():
 
         # Release resources
         executor.shutdown()
+
+        if self.to_backup or self.to_delete:
+            # Queue files for backup or deletion
+            self.files_to_delete_or_backup = self.files_to_download.copy()
+
         # Clear pending files
-        self.files.clear()
+        self.files_to_download.clear()
+
+    def backup_files_concurrent(self):
+        """
+        Move files concurrently using MAX_THREADS workers
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_THREADS) as executor:
+            futures = []
+            for file in self.files_to_download:
+                futures.append(executor.submit(self.move_file, file=file))
+                
+            for future in concurrent.futures.as_completed(futures):
+                log.info(future.result())
+
+        # Release resources
+        executor.shutdown()
+        # Clear pending files
+        self.files_to_delete_or_backup.clear()
+
+    def delete_files_concurrent(self):
+        """
+        Delete files concurrently using MAX_THREADS workers
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_THREADS) as executor:
+            futures = []
+            for file in self.files_to_download:
+                futures.append(executor.submit(self.delete_file, file=file))
+                
+            for future in concurrent.futures.as_completed(futures):
+                log.info(future.result())
+
+        # Release resources
+        executor.shutdown()
+        # Clear pending files
+        self.files_to_delete_or_backup.clear()
 
     def set_file(self, parentfolderid, name, filelink):
         """
@@ -136,7 +181,7 @@ class Downloader():
             file['filePath'] = f"{name}"
 
         file['url'] = f"https://{filelink['hosts'][1]}{filelink['path']}"
-        self.files.append(file)
+        self.files_to_download.append(file)
 
     def set_folder(self, parentfolderid, folderid, name):
         """
@@ -161,22 +206,46 @@ rotatingHandler = RotatingFileHandler('l.log', maxBytes=500_000_000, backupCount
 logging.basicConfig(handlers=[rotatingHandler], encoding='utf-8', level=logging.INFO, format='%(asctime)s\t%(message)s',  datefmt='%Y-%m-%d %H:%M:%S')
 
 if __name__ == '__main__':
+    import argparse
     import configparser
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-config')
+    parser.add_argument('--subdir', default='')
+    args = parser.parse_args()
+    
     config = configparser.ConfigParser()
-    config.read('.conf')
-    pc = Downloader(config.get('funan', 'token'), config.get('funan', 'remote_dir'), config.get('funan', 'local_dir'), config.get('funan', 'max_download_threads'))
+    config.read(args.config)
+    pc = Downloader(
+        m_token=config.get('', 'token'), 
+        m_remote_dir=config.get('', 'remote_dir'), 
+        m_to_download=config.getboolean('', 'download'),
+        m_local_dir=config.get('funan', 'local_dir'), 
+        m_max_download_threads=config.getint('', 'max_download_threads'),
+        m_to_delete=config.getboolean('', 'delete'),
+        m_to_backup=config.getboolean('', 'backup'),
+    )
+    
+    try:
+        resp = pc.get_all_metadata(pc.REMOTE_DIR + args.subdir.rstrip("/")) # Remove trailing slash, else api will return not found
+    except requests.exceptions.RequestException as e:
+        raise SystemExit(e)
+        
+    if pc.to_download:
+        if isinstance(resp, dict) and resp['result'] == 0:
+            if 'metadata' in resp:
+                # Root folder
+                if resp['metadata']['isfolder'] is True:
+                    pc.set_folder(None, resp['metadata']['folderid'], resp['metadata']['path'])
+            
+                try:
+                    pc.get_file_objects(resp['metadata']['contents'])
+                except requests.exceptions.RequestException as e:
+                    raise SystemExit(e)
+        else:
+            print(f"[Error] {resp}")
 
-    resp = pc.get_all_metadata(pc.REMOTE_DIR)
-    if isinstance(resp, dict) and resp['result'] == 0:
-        if 'metadata' in resp:
-            # Root folder
-            if resp['metadata']['isfolder'] is True:
-                pc.set_folder(None, resp['metadata']['folderid'], resp['metadata']['path'])
-
-            pc.get_file_objects(resp['metadata']['contents'])
-
-    if len(pc.files) == 0:
+    if len(pc.files_to_download) == 0:
         print('No remaining files')
     
     print('Done')
