@@ -1,3 +1,5 @@
+#!/home/test/venv/bin/python
+
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -8,8 +10,8 @@ import concurrent.futures
 log = logging.getLogger(__name__)
 
 """
-Keep track of files that are downloaded, so that we do not download again.
-Delete / move files already downloaded, so that we do not download again. - When? May not be complete at time of download
+Keep track of files that are downloaded, so that we do not download again. May not be complete at time of download (X)
+Delete / move files already downloaded - When? 
 Encrypt files again before uploading.
 Delete files from local drive and source drive after uploading 
 Scrape frequency???
@@ -65,19 +67,26 @@ class Downloader():
 
     def get_file_objects(self, file_objs):
         """
-        Iterates and downloads list of files
+        Iterates and downloads list of files. Skips download if files exist locally.
 
         @param file_objs: Metadata of files to download
         """
         for obj in file_objs:
             if obj['isfolder'] is True:
                 # Folders
+
                 self.set_folder(obj['parentfolderid'], obj['folderid'], obj['name'])
             else:
                 # Files
+                
+                localFileName = f"{self.LOCAL_DIR}/{self.folders[str(obj['parentfolderid'])]}/{obj['name']}"
+                # Skips download if the file exists locally, i.e. already downloaded
+                if os.path.exists(localFileName) and os.stat(localFileName).st_size == int(obj['size']):
+                    continue
+
                 filelink_obj = self.get_file_link(obj['fileid'])
                 if filelink_obj['result'] == 0:
-                    self.set_file(obj['parentfolderid'], obj['name'], filelink_obj)
+                    self.set_file(obj['parentfolderid'], obj['name'], obj['fileid'], obj['size'], filelink_obj)
         
             # Downloads files concurrently
             if len(self.files_to_download) >= self.MAX_THREADS:
@@ -138,7 +147,7 @@ class Downloader():
         """
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_THREADS) as executor:
             futures = []
-            for file in self.files_to_download:
+            for file in self.files_to_delete_or_backup:
                 futures.append(executor.submit(self.move_file, file=file))
                 
             for future in concurrent.futures.as_completed(futures):
@@ -155,7 +164,7 @@ class Downloader():
         """
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_THREADS) as executor:
             futures = []
-            for file in self.files_to_download:
+            for file in self.files_to_delete_or_backup:
                 futures.append(executor.submit(self.delete_file, file=file))
                 
             for future in concurrent.futures.as_completed(futures):
@@ -166,20 +175,24 @@ class Downloader():
         # Clear pending files
         self.files_to_delete_or_backup.clear()
 
-    def set_file(self, parentfolderid, name, filelink):
+    def set_file(self, parentfolderid, filename, fileid, filesize, filelink):
         """
-        Adds file to list of files to be downloads
+        Adds a file obj to the list of files to be downloads
 
         @param parentfolderid: Folder id of parent folder
-        @param name: Name of file
-        @param filelink: Hostnames and path (from the getfilelink api)  
+        @param filename: Name of file
+        @param fileid: File id
+        @param filesize: File size (bytes)
+        @param filelink: Hostnames and path (from getfilelink api)  
         """        
         file = {}
         if parentfolderid:
-            file['filePath'] = f"{self.folders[str(parentfolderid)]}/{name}"
+            file['filePath'] = f"{self.folders[str(parentfolderid)]}/{filename}"
         else:
-            file['filePath'] = f"{name}"
-
+            file['filePath'] = f"{filename}"
+        
+        file['fileId'] = f"{fileid}"
+        file['fileSize'] = f"{filesize}"
         file['url'] = f"https://{filelink['hosts'][1]}{filelink['path']}"
         self.files_to_download.append(file)
 
@@ -220,7 +233,7 @@ if __name__ == '__main__':
         m_token=config.get('', 'token'), 
         m_remote_dir=config.get('', 'remote_dir'), 
         m_to_download=config.getboolean('', 'download'),
-        m_local_dir=config.get('funan', 'local_dir'), 
+        m_local_dir=config.get('', 'local_dir'), 
         m_max_download_threads=config.getint('', 'max_download_threads'),
         m_to_delete=config.getboolean('', 'delete'),
         m_to_backup=config.getboolean('', 'backup'),
@@ -247,5 +260,3 @@ if __name__ == '__main__':
 
     if len(pc.files_to_download) == 0:
         print('No remaining files')
-    
-    print('Done')
